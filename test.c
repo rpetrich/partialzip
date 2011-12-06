@@ -9,6 +9,13 @@ void callback(ZipInfo* info, CDFile* file, size_t progress) {
 	printf("Getting: %d%%\n", percentDone);
 }
 
+size_t data_callback(ZipInfo* info, CDFile* file, unsigned char *buffer, size_t size, void *userInfo)
+{
+	char **pos = userInfo;
+	memcpy(*pos, buffer, size);
+	*pos += size;
+}
+
 int main(int argc, char* argv[]) {
 	ZipInfo* info = PartialZipInit("file://test.zip");
 	if(!info)
@@ -26,14 +33,14 @@ int main(int argc, char* argv[]) {
 		return 0;
 	}
 
-	unsigned char* data = PartialZipGetFile(info, file);
-	int dataLen = file->size; 
+	int dataLen = file->size;
+	unsigned char *data = malloc(dataLen+1);
+	unsigned char *pos = data;
+	PartialZipGetFile(info, file, data_callback, &pos);
+	*pos = '\0';
 
 	PartialZipRelease(info);
 
-	data = realloc(data, dataLen + 1);
-	data[dataLen] = '\0';
-	
 	printf("%s\n", data);
 
 	free(data);

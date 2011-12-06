@@ -1,5 +1,6 @@
 #include <inttypes.h>
 #include <curl/curl.h>
+#include <stdbool.h>
 
 typedef struct EndOfCD {
 	uint32_t signature;
@@ -50,6 +51,8 @@ typedef struct ZipInfo ZipInfo;
 
 typedef void (*PartialZipProgressCallback)(ZipInfo* info, CDFile* file, size_t progress);
 
+typedef size_t (*PartialZipGetFileCallback)(ZipInfo* info, CDFile* file, unsigned char *buffer, size_t size, void *userInfo);
+
 struct ZipInfo {
 	char* url;
 	uint64_t length;
@@ -72,7 +75,7 @@ extern "C" {
 
 	CDFile* PartialZipListFiles(ZipInfo* info);
 
-	unsigned char* PartialZipGetFile(ZipInfo* info, CDFile* file);
+	bool PartialZipGetFile(ZipInfo* info, CDFile* file, PartialZipGetFileCallback callback, void *userInfo);
 
 	void PartialZipRelease(ZipInfo* info);
 	
