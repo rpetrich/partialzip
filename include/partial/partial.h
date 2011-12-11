@@ -56,7 +56,7 @@ typedef size_t (*PartialZipGetFileCallback)(ZipInfo* info, CDFile* file, unsigne
 struct ZipInfo {
 	char* url;
 	uint64_t length;
-	CURL* hIPSW;
+	CURL* hCurl;
 	char* centralDirectory;
 	size_t centralDirectoryRecvd;
 	EndOfCD* centralDirectoryDesc;
