@@ -194,12 +194,13 @@ CDFile* PartialZipFindFile(ZipInfo* info, const char* fileName)
 {
 	char* cur = info->centralDirectory;
 	unsigned int i;
+	size_t fileNameLength = strlen(fileName);
 	for(i = 0; i < info->centralDirectoryDesc->CDEntries; i++)
 	{
 		CDFile* candidate = (CDFile*) cur;
 		const char* curFileName = cur + sizeof(CDFile);
 
-		if(strlen(fileName) == candidate->lenFileName && strncmp(fileName, curFileName, candidate->lenFileName) == 0)
+		if(fileNameLength == candidate->lenFileName && strncmp(fileName, curFileName, candidate->lenFileName) == 0)
 			return candidate;
 
 		cur += sizeof(CDFile) + candidate->lenFileName + candidate->lenExtra + candidate->lenComment;
