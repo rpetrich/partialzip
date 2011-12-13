@@ -378,7 +378,7 @@ static size_t receiveDataBodySingle(unsigned char* data, size_t size, size_t nme
 		if (byteCount < pFileData->bytesLeftInData) {
 			if (pFileData->processBodyCallback(data, byteCount, bodyData) != byteCount)
 				return 0;
-			pFileData->bytesLeftInLocalFile -= byteCount;
+			pFileData->bytesLeftInData -= byteCount;
 			return size * nmemb;
 		}
 		if (pFileData->processBodyCallback(data, pFileData->bytesLeftInData, bodyData) != pFileData->bytesLeftInData)
