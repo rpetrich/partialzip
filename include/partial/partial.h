@@ -76,6 +76,7 @@ extern "C" {
 	CDFile* PartialZipListFiles(ZipInfo* info);
 
 	bool PartialZipGetFile(ZipInfo* info, CDFile* file, PartialZipGetFileCallback callback, void *userInfo);
+	bool PartialZipGetFiles(ZipInfo* info, CDFile* files[], size_t count, PartialZipGetFileCallback callback, void *userInfo);
 
 	void PartialZipRelease(ZipInfo* info);
 	

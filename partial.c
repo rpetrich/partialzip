@@ -234,40 +234,74 @@ CDFile* PartialZipListFiles(ZipInfo* info)
 
 typedef struct ReceiveBodyData* ReceiveDataBodyDataRef;
 
-typedef struct ReceiveBodyData {
-	ZipInfo *info;
+typedef struct ReceiveBodyFileData {
 	CDFile *file;
 	union {
 		LocalFile localFile;
 		char localFileBytes[sizeof(LocalFile)];
 	};
+	size_t rangeSize;
 	size_t bytesLeftInLocalFile;
 	size_t bytesLeftBeforeData;
 	size_t bytesLeftInData;
+	void (*startBodyCallback)(ReceiveDataBodyDataRef);
+	size_t (*processBodyCallback)(unsigned char*, size_t, ReceiveDataBodyDataRef);
+	void (*finishBodyCallback)(ReceiveDataBodyDataRef);
+	z_stream stream; // Unused for uncompressed data
+} ReceiveBodyFileData;
+
+typedef struct ReceiveBodyData {
+	ZipInfo *info;
 	PartialZipGetFileCallback callback;
 	void *userInfo;
-	size_t (*processBodyCallback)(unsigned char*, size_t, ReceiveDataBodyDataRef);
-	z_stream stream; // Unused for uncompressed data
+	ReceiveBodyFileData *currentFile;
+	unsigned char *multipartBoundary;
 } ReceiveDataBodyData;
+
+// Uncompressed File Data
+
+static void startBodyUncompressed(ReceiveDataBodyDataRef bodyData)
+{
+}
+
+static size_t receiveDataBodyUncompressed(unsigned char* data, size_t size, ReceiveDataBodyDataRef bodyData)
+{
+	return bodyData->callback(bodyData->info, bodyData->currentFile->file, data, size, bodyData->userInfo);
+}
+
+static void finishBodyUncompressed(ReceiveDataBodyDataRef bodyData)
+{
+}
+
+// ZLIB Compressed File Data
 
 #define ZLIB_BUFFER_SIZE 4096
 
-static size_t receiveDataBodyUncompressed(unsigned char* data, size_t size, ReceiveDataBodyDataRef pFileData) {
-	return pFileData->callback(pFileData->info, pFileData->file, data, size, pFileData->userInfo);
+static void startBodyZLIBCompressed(ReceiveDataBodyDataRef bodyData)
+{
+	ReceiveBodyFileData *fileData = bodyData->currentFile;
+	fileData->stream.zalloc = Z_NULL;
+	fileData->stream.zfree = Z_NULL;
+	fileData->stream.opaque = Z_NULL;
+	fileData->stream.avail_in = 0;
+	fileData->stream.next_in = NULL;
+	inflateInit2(&fileData->stream, -MAX_WBITS);
 }
 
-static size_t receiveDataBodyZLIBCompressed(unsigned char* data, size_t size, ReceiveDataBodyDataRef pFileData) {
-	pFileData->stream.next_in = data;
+static size_t receiveDataBodyZLIBCompressed(unsigned char* data, size_t size, ReceiveDataBodyDataRef bodyData)
+{
+	ReceiveBodyFileData *fileData = bodyData->currentFile;
+	fileData->stream.next_in = data;
 	size_t result = size;
-	pFileData->stream.avail_in = result;
+	fileData->stream.avail_in = result;
 	unsigned char buffer[ZLIB_BUFFER_SIZE];
 	do {
-		pFileData->stream.next_out = buffer;
-		pFileData->stream.avail_out = ZLIB_BUFFER_SIZE;
-		int err = inflate(&pFileData->stream, Z_NO_FLUSH);
-		if (pFileData->stream.avail_out != ZLIB_BUFFER_SIZE) {
-			size_t new_bytes = ZLIB_BUFFER_SIZE - pFileData->stream.avail_out;
-			size_t bytes_read = pFileData->callback(pFileData->info, pFileData->file, buffer, new_bytes, pFileData->userInfo);
+		fileData->stream.next_out = buffer;
+		fileData->stream.avail_out = ZLIB_BUFFER_SIZE;
+		int err = inflate(&fileData->stream, Z_NO_FLUSH);
+		if (fileData->stream.avail_out != ZLIB_BUFFER_SIZE) {
+			size_t new_bytes = ZLIB_BUFFER_SIZE - fileData->stream.avail_out;
+			size_t bytes_read = bodyData->callback(bodyData->info, fileData->file, buffer, new_bytes, bodyData->userInfo);
 			if (bytes_read != new_bytes) {
 				// Abort if callback doesn't read all data
 				return 0;
@@ -276,16 +310,43 @@ static size_t receiveDataBodyZLIBCompressed(unsigned char* data, size_t size, Re
 		switch (err) {
 			case Z_OK:
 			case Z_STREAM_END:
-				break;
+				goto return_result;
 			default:
 				// Abort if there's some sort of zlib stream error
 				return 0;
 		}
-	} while (pFileData->stream.avail_in);
+	} while (fileData->stream.avail_in);
+return_result:
+	return result;
 }
 
-static size_t receiveDataBody(unsigned char* data, size_t size, size_t nmemb, ReceiveDataBodyData *pFileData) {
+static void finishBodyZLIBCompressed(ReceiveDataBodyDataRef bodyData)
+{
+	ReceiveBodyFileData *fileData = bodyData->currentFile;
+	unsigned char buffer[ZLIB_BUFFER_SIZE];
+	int err;
+	do {
+		fileData->stream.next_out = buffer;
+		fileData->stream.avail_out = ZLIB_BUFFER_SIZE;
+		err = inflate(&fileData->stream, Z_SYNC_FLUSH);
+		if (fileData->stream.avail_out != ZLIB_BUFFER_SIZE) {
+			size_t new_bytes = ZLIB_BUFFER_SIZE - fileData->stream.avail_out;
+			size_t bytes_read = bodyData->callback(bodyData->info, fileData->file, buffer, new_bytes, bodyData->userInfo);
+			if (bytes_read != new_bytes) {
+				// Abort if callback doesn't read all data
+				break;
+			}
+		}
+	} while (err == Z_OK);
+	inflateEnd(&fileData->stream);
+}
+
+// Single part responses (single range)
+
+static size_t receiveDataBodySingle(unsigned char* data, size_t size, size_t nmemb, ReceiveDataBodyDataRef bodyData)
+{
 	size_t byteCount = size * nmemb;
+	ReceiveBodyFileData *pFileData = bodyData->currentFile;
 	// Read LocalFile header
 	if (pFileData->bytesLeftInLocalFile) {
 		if (byteCount < pFileData->bytesLeftInLocalFile) {
@@ -309,7 +370,6 @@ static size_t receiveDataBody(unsigned char* data, size_t size, size_t nmemb, Re
 		FLIPENDIANLE(pFileData->localFile.lenFileName);
 		FLIPENDIANLE(pFileData->localFile.lenExtra);
 		pFileData->bytesLeftBeforeData = pFileData->localFile.lenFileName + pFileData->localFile.lenExtra;
-		pFileData->bytesLeftInData = pFileData->file->compressedSize;
 	}
 	// Read file name and extra bytes before body
 	if (pFileData->bytesLeftBeforeData) {
@@ -320,22 +380,58 @@ static size_t receiveDataBody(unsigned char* data, size_t size, size_t nmemb, Re
 		data += pFileData->bytesLeftBeforeData;
 		byteCount -= pFileData->bytesLeftBeforeData;
 		pFileData->bytesLeftBeforeData = 0;
+		pFileData->startBodyCallback(bodyData);
 	}
 	// Read body
-	if (pFileData->bytesLeftInData && byteCount) {
+	if (pFileData->bytesLeftInData) {
 		if (byteCount < pFileData->bytesLeftInData) {
-			if (pFileData->processBodyCallback(data, byteCount, pFileData) != byteCount)
+			if (pFileData->processBodyCallback(data, byteCount, bodyData) != byteCount)
 				return 0;
 			pFileData->bytesLeftInLocalFile -= byteCount;
-		} else {
-			if (pFileData->processBodyCallback(data, pFileData->bytesLeftInData, pFileData) != pFileData->bytesLeftInData)
-				return 0;
-			pFileData->bytesLeftInLocalFile = 0;
+			return size * nmemb;
 		}
+		if (pFileData->processBodyCallback(data, pFileData->bytesLeftInData, bodyData) != pFileData->bytesLeftInData)
+			return 0;
+		pFileData->finishBodyCallback(bodyData);
+		byteCount -= pFileData->bytesLeftInData;
+		pFileData->bytesLeftInData = 0;
 	}
-	// Skip trailing bytes
 	return size * nmemb;
 }
+
+// Multi-part responses
+
+#define BOUNDARY_HEADER_PREFIX "Content-Type: multipart/byteranges; boundary="
+
+static size_t receiveHeaderMulti(unsigned char* data, size_t size, size_t nmemb, ReceiveDataBodyDataRef bodyData)
+{
+	size_t byteCount = size * nmemb;
+	if (byteCount > sizeof(BOUNDARY_HEADER_PREFIX)) {
+		if (memcmp(data, BOUNDARY_HEADER_PREFIX, sizeof(BOUNDARY_HEADER_PREFIX)-1) == 0) {
+			unsigned char *start = data + sizeof(BOUNDARY_HEADER_PREFIX)-1;
+			unsigned char *end = start;
+			while (*end != '\r')
+				end++;
+			unsigned char *copy = malloc(end - start);
+			memcpy(copy, start, end - start);
+			copy[end - start] = '\0';
+			if (bodyData->multipartBoundary)
+				free(bodyData->multipartBoundary);
+			bodyData->multipartBoundary = copy;
+		}
+	}
+	return byteCount;
+}
+
+static size_t receiveDataBodyMulti(unsigned char* data, size_t size, size_t nmemb, ReceiveDataBodyDataRef bodyData)
+{
+	// Check if server Returned a multipart/byteranges
+	if (!bodyData->multipartBoundary)
+		return 0;
+	// TODO: Implement multpart decoding
+	return 0;
+}
+
 
 static uint64_t PartialZipFileMaximumEndpoint(ZipInfo* info, CDFile* file)
 {
@@ -348,74 +444,98 @@ static uint64_t PartialZipFileMaximumEndpoint(ZipInfo* info, CDFile* file)
 		size_t candidateOffset = candidate->offset;
 		if ((candidateOffset > fileOffset) && (candidateOffset < result))
 			result = candidateOffset;
+		cur += sizeof(CDFile) + candidate->lenFileName + candidate->lenExtra + candidate->lenComment;
 	}
 
 	return result;
 }
 
+bool PartialZipGetFiles(ZipInfo* info, CDFile* files[], size_t count, PartialZipGetFileCallback callback, void *userInfo)
+{
+	if (!count)
+		return true;
+
+	ReceiveBodyFileData fileData[count];
+	curl_easy_setopt(info->hCurl, CURLOPT_HTTPGET, 1);
+
+	// Apply Range string
+	size_t i;
+	size_t rangeLength = 0;
+	for (i = 0; i < count; i++) {
+		uint64_t start = files[i]->offset;
+		uint64_t end = PartialZipFileMaximumEndpoint(info, files[i]);
+		fileData[i].rangeSize = end - start - 1;
+		char temp[100];
+		rangeLength += sprintf(temp, "%" PRIu64 "%" PRIu64, start, end) + 2;
+	}
+	char range[rangeLength];
+	char *rangeCurrent = range;
+	for (i = 0; i < count; i++) {
+		uint64_t start = files[i]->offset;
+		uint64_t end = start + fileData[i].rangeSize;
+		rangeCurrent += sprintf(rangeCurrent, "%" PRIu64 "-%" PRIu64 ",", start, end);
+	}
+	rangeCurrent[-1] = '\0';
+	curl_easy_setopt(info->hCurl, CURLOPT_RANGE, range);
+	
+	// Build file data for each file
+	for (i = 0; i < count; i++) {
+		fileData[i].file = files[i];
+		fileData[i].bytesLeftInLocalFile = sizeof(LocalFile);
+		fileData[i].bytesLeftInData = files[i]->compressedSize;
+		switch (files[i]->method) {
+			case 8:
+				fileData[i].startBodyCallback = startBodyZLIBCompressed;
+				fileData[i].processBodyCallback = receiveDataBodyZLIBCompressed;
+				fileData[i].finishBodyCallback = finishBodyZLIBCompressed;
+				break;
+			default:
+				fileData[i].startBodyCallback = startBodyUncompressed;
+				fileData[i].processBodyCallback = receiveDataBodyUncompressed;
+				fileData[i].finishBodyCallback = finishBodyUncompressed;
+				break;
+		}
+	}
+
+	// Build body data
+	ReceiveDataBodyData bodyData;
+	bodyData.info = info;
+	bodyData.callback = callback;
+	bodyData.userInfo = userInfo;
+	bodyData.currentFile = &fileData[0];
+	
+	// Make request
+	curl_easy_setopt(info->hCurl, CURLOPT_WRITEDATA, &bodyData);
+	int curl_result;
+	if (count == 1) {
+		curl_easy_setopt(info->hCurl, CURLOPT_WRITEFUNCTION, receiveDataBodySingle);
+		curl_easy_setopt(info->hCurl, CURLOPT_HEADERDATA, NULL);
+		curl_easy_setopt(info->hCurl, CURLOPT_HEADERFUNCTION, NULL);
+		curl_result = curl_easy_perform(info->hCurl);
+	} else {
+		curl_easy_setopt(info->hCurl, CURLOPT_WRITEFUNCTION, receiveDataBodyMulti);
+		curl_easy_setopt(info->hCurl, CURLOPT_HEADERDATA, &bodyData);
+		curl_easy_setopt(info->hCurl, CURLOPT_HEADERFUNCTION, receiveHeaderMulti);
+		bodyData.multipartBoundary = NULL;
+		curl_result = curl_easy_perform(info->hCurl);
+		//if (bodyData.multipartBoundary) {
+			free(bodyData.multipartBoundary);
+		//} else {
+			// Multi-part failed, fallback to a single request per file
+			for (i = 0; i < count; i++)
+				if (!PartialZipGetFiles(info, &files[i], 1, callback, userInfo))
+					return false;
+			return true;
+		//}
+	}
+
+	return curl_result == 0;
+}
+
 bool PartialZipGetFile(ZipInfo* info, CDFile* file, PartialZipGetFileCallback callback, void *userInfo)
 {
-	LocalFile localHeader;
-	LocalFile* pLocalHeader = &localHeader;
-
-	uint64_t start = file->offset;
-	uint64_t end = file->offset + PartialZipFileMaximumEndpoint(info, file) - 1;
-	char sRange[100];
-	sprintf(sRange, "%" PRIu64 "-%" PRIu64, start, end);
-
-	curl_easy_setopt(info->hCurl, CURLOPT_RANGE, sRange);
-	curl_easy_setopt(info->hCurl, CURLOPT_HTTPGET, 1);
-	ReceiveDataBodyData fileData;
-	fileData.bytesLeftInLocalFile = sizeof(LocalFile);
-	fileData.info = info;
-	fileData.file = file;
-	fileData.callback = callback;
-	fileData.userInfo = userInfo;
-	switch (file->method) {
-		case 8:
-			fileData.processBodyCallback = receiveDataBodyZLIBCompressed;
-			fileData.stream.zalloc = Z_NULL;
-			fileData.stream.zfree = Z_NULL;
-			fileData.stream.opaque = Z_NULL;
-			fileData.stream.avail_in = 0;
-			fileData.stream.next_in = NULL;
-			inflateInit2(&fileData.stream, -MAX_WBITS);
-			break;
-		default:
-			fileData.processBodyCallback = receiveDataBodyUncompressed;
-			break;
-	}
-	curl_easy_setopt(info->hCurl, CURLOPT_WRITEFUNCTION, receiveDataBody);
-	curl_easy_setopt(info->hCurl, CURLOPT_WRITEDATA, &fileData);
-	int curl_result = curl_easy_perform(info->hCurl);
-	switch (file->method) {
-		case 8: {
-			if (curl_result != 0) {
-				inflateEnd(&fileData.stream);
-				return false;
-			}
-			unsigned char buffer[ZLIB_BUFFER_SIZE];
-			int err;
-			do {
-				fileData.stream.next_out = buffer;
-				fileData.stream.avail_out = ZLIB_BUFFER_SIZE;
-				err = inflate(&fileData.stream, Z_SYNC_FLUSH);
-				if (fileData.stream.avail_out != ZLIB_BUFFER_SIZE) {
-					size_t new_bytes = ZLIB_BUFFER_SIZE - fileData.stream.avail_out;
-					size_t bytes_read = callback(info, file, buffer, new_bytes, userInfo);
-					if (bytes_read != new_bytes) {
-						// Abort if callback doesn't read all data
-						inflateEnd(&fileData.stream);
-						return false;
-					}
-				}
-			} while (err == Z_OK);
-			inflateEnd(&fileData.stream);
-			return err == Z_STREAM_END;
-		}
-		default:
-			return curl_result == 0;
-	}
+	CDFile *files[1] = { file };
+	return PartialZipGetFiles(info, files, 1, callback, userInfo);
 }
 
 void PartialZipSetProgressCallback(ZipInfo* info, PartialZipProgressCallback progressCallback)
