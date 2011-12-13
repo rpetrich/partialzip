@@ -232,23 +232,33 @@ CDFile* PartialZipListFiles(ZipInfo* info)
 	return NULL;
 }
 
-typedef struct {
+typedef struct ReceiveBodyData* ReceiveDataBodyDataRef;
+
+typedef struct ReceiveBodyData {
 	ZipInfo *info;
 	CDFile *file;
+	union {
+		LocalFile localFile;
+		char localFileBytes[sizeof(LocalFile)];
+	};
+	size_t bytesLeftInLocalFile;
+	size_t bytesLeftBeforeData;
+	size_t bytesLeftInData;
 	PartialZipGetFileCallback callback;
 	void *userInfo;
+	size_t (*processBodyCallback)(unsigned char*, size_t, ReceiveDataBodyDataRef);
 	z_stream stream; // Unused for uncompressed data
 } ReceiveDataBodyData;
 
 #define ZLIB_BUFFER_SIZE 4096
 
-static size_t receiveDataBodyUncompressed(void* data, size_t size, size_t nmemb, ReceiveDataBodyData *pFileData) {
-	return pFileData->callback(pFileData->info, pFileData->file, data, size * nmemb, pFileData->userInfo);
+static size_t receiveDataBodyUncompressed(unsigned char* data, size_t size, ReceiveDataBodyDataRef pFileData) {
+	return pFileData->callback(pFileData->info, pFileData->file, data, size, pFileData->userInfo);
 }
 
-static size_t receiveDataBodyZLIBCompressed(void* data, size_t size, size_t nmemb, ReceiveDataBodyData *pFileData) {
+static size_t receiveDataBodyZLIBCompressed(unsigned char* data, size_t size, ReceiveDataBodyDataRef pFileData) {
 	pFileData->stream.next_in = data;
-	size_t result = size * nmemb;
+	size_t result = size;
 	pFileData->stream.avail_in = result;
 	unsigned char buffer[ZLIB_BUFFER_SIZE];
 	do {
@@ -272,6 +282,74 @@ static size_t receiveDataBodyZLIBCompressed(void* data, size_t size, size_t nmem
 				return 0;
 		}
 	} while (pFileData->stream.avail_in);
+}
+
+static size_t receiveDataBody(unsigned char* data, size_t size, size_t nmemb, ReceiveDataBodyData *pFileData) {
+	size_t byteCount = size * nmemb;
+	// Read LocalFile header
+	if (pFileData->bytesLeftInLocalFile) {
+		if (byteCount < pFileData->bytesLeftInLocalFile) {
+			memcpy(&pFileData->localFileBytes[sizeof(LocalFile) - pFileData->bytesLeftInLocalFile], data, byteCount);
+			pFileData->bytesLeftInLocalFile -= byteCount;
+			return size * nmemb;
+		}
+		memcpy(&pFileData->localFileBytes[sizeof(LocalFile) - pFileData->bytesLeftInLocalFile], data, pFileData->bytesLeftInLocalFile);
+		data += pFileData->bytesLeftInLocalFile;
+		byteCount -= pFileData->bytesLeftInLocalFile;
+		pFileData->bytesLeftInLocalFile = 0;
+		FLIPENDIANLE(pFileData->localFile.signature);
+		FLIPENDIANLE(pFileData->localFile.versionExtract);
+		// FLIPENDIANLE(pFileData->localFile.flags);
+		FLIPENDIANLE(pFileData->localFile.method);
+		FLIPENDIANLE(pFileData->localFile.modTime);
+		FLIPENDIANLE(pFileData->localFile.modDate);
+		// FLIPENDIANLE(pFileData->localFile.crc32);
+		FLIPENDIANLE(pFileData->localFile.compressedSize);
+		FLIPENDIANLE(pFileData->localFile.size);
+		FLIPENDIANLE(pFileData->localFile.lenFileName);
+		FLIPENDIANLE(pFileData->localFile.lenExtra);
+		pFileData->bytesLeftBeforeData = pFileData->localFile.lenFileName + pFileData->localFile.lenExtra;
+		pFileData->bytesLeftInData = pFileData->file->compressedSize;
+	}
+	// Read file name and extra bytes before body
+	if (pFileData->bytesLeftBeforeData) {
+		if (byteCount < pFileData->bytesLeftBeforeData) {
+			pFileData->bytesLeftBeforeData -= byteCount;
+			return size * nmemb;
+		}
+		data += pFileData->bytesLeftBeforeData;
+		byteCount -= pFileData->bytesLeftBeforeData;
+		pFileData->bytesLeftBeforeData = 0;
+	}
+	// Read body
+	if (pFileData->bytesLeftInData && byteCount) {
+		if (byteCount < pFileData->bytesLeftInData) {
+			if (pFileData->processBodyCallback(data, byteCount, pFileData) != byteCount)
+				return 0;
+			pFileData->bytesLeftInLocalFile -= byteCount;
+		} else {
+			if (pFileData->processBodyCallback(data, pFileData->bytesLeftInData, pFileData) != pFileData->bytesLeftInData)
+				return 0;
+			pFileData->bytesLeftInLocalFile = 0;
+		}
+	}
+	// Skip trailing bytes
+	return size * nmemb;
+}
+
+static uint64_t PartialZipFileMaximumEndpoint(ZipInfo* info, CDFile* file)
+{
+	char* cur = info->centralDirectory;
+	size_t result = info->centralDirectoryDesc->CDOffset;
+	size_t fileOffset = file->offset;
+	unsigned int i;
+	for(i = 0; i < info->centralDirectoryDesc->CDEntries; i++) {
+		CDFile* candidate = (CDFile*) cur;
+		size_t candidateOffset = candidate->offset;
+		if ((candidateOffset > fileOffset) && (candidateOffset < result))
+			result = candidateOffset;
+	}
+
 	return result;
 }
 
@@ -281,57 +359,33 @@ bool PartialZipGetFile(ZipInfo* info, CDFile* file, PartialZipGetFileCallback ca
 	LocalFile* pLocalHeader = &localHeader;
 
 	uint64_t start = file->offset;
-	uint64_t end = file->offset + sizeof(LocalFile) - 1;
+	uint64_t end = file->offset + PartialZipFileMaximumEndpoint(info, file) - 1;
 	char sRange[100];
 	sprintf(sRange, "%" PRIu64 "-%" PRIu64, start, end);
 
-	void* pFileHeader[] = {pLocalHeader, NULL, NULL, NULL}; 
-
-	curl_easy_setopt(info->hCurl, CURLOPT_URL, info->url);
-	curl_easy_setopt(info->hCurl, CURLOPT_FOLLOWLOCATION, 1);
-	curl_easy_setopt(info->hCurl, CURLOPT_WRITEFUNCTION, receiveData);
-	curl_easy_setopt(info->hCurl, CURLOPT_WRITEDATA, &pFileHeader);
 	curl_easy_setopt(info->hCurl, CURLOPT_RANGE, sRange);
 	curl_easy_setopt(info->hCurl, CURLOPT_HTTPGET, 1);
-	curl_easy_perform(info->hCurl);
-	
-	FLIPENDIANLE(localHeader.signature);
-	FLIPENDIANLE(localHeader.versionExtract);
-	// FLIPENDIANLE(localHeader.flags);
-	FLIPENDIANLE(localHeader.method);
-	FLIPENDIANLE(localHeader.modTime);
-	FLIPENDIANLE(localHeader.modDate);
-	// FLIPENDIANLE(localHeader.crc32);
-	FLIPENDIANLE(localHeader.compressedSize);
-	FLIPENDIANLE(localHeader.size);
-	FLIPENDIANLE(localHeader.lenFileName);
-	FLIPENDIANLE(localHeader.lenExtra);
-
-	start = file->offset + sizeof(LocalFile) + localHeader.lenFileName + localHeader.lenExtra;
-	end = start + file->compressedSize - 1;
-	sprintf(sRange, "%" PRIu64 "-%" PRIu64, start, end);
-
-	curl_easy_setopt(info->hCurl, CURLOPT_RANGE, sRange);
-	curl_easy_setopt(info->hCurl, CURLOPT_HTTPGET, 1);
-	ReceiveDataBodyData fileData = { info, file, callback, userInfo };
+	ReceiveDataBodyData fileData;
+	fileData.bytesLeftInLocalFile = sizeof(LocalFile);
 	fileData.info = info;
 	fileData.file = file;
 	fileData.callback = callback;
 	fileData.userInfo = userInfo;
 	switch (file->method) {
 		case 8:
+			fileData.processBodyCallback = receiveDataBodyZLIBCompressed;
 			fileData.stream.zalloc = Z_NULL;
 			fileData.stream.zfree = Z_NULL;
 			fileData.stream.opaque = Z_NULL;
 			fileData.stream.avail_in = 0;
 			fileData.stream.next_in = NULL;
 			inflateInit2(&fileData.stream, -MAX_WBITS);
-			curl_easy_setopt(info->hCurl, CURLOPT_WRITEFUNCTION, receiveDataBodyZLIBCompressed);
 			break;
 		default:
-			curl_easy_setopt(info->hCurl, CURLOPT_WRITEFUNCTION, receiveDataBodyUncompressed);
+			fileData.processBodyCallback = receiveDataBodyUncompressed;
 			break;
 	}
+	curl_easy_setopt(info->hCurl, CURLOPT_WRITEFUNCTION, receiveDataBody);
 	curl_easy_setopt(info->hCurl, CURLOPT_WRITEDATA, &fileData);
 	int curl_result = curl_easy_perform(info->hCurl);
 	switch (file->method) {
