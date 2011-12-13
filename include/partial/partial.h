@@ -49,8 +49,6 @@ typedef struct LocalFile {
 
 typedef struct ZipInfo ZipInfo;
 
-typedef void (*PartialZipProgressCallback)(ZipInfo* info, CDFile* file, size_t progress);
-
 typedef size_t (*PartialZipGetFileCallback)(ZipInfo* info, CDFile* file, unsigned char *buffer, size_t size, void *userInfo);
 
 struct ZipInfo {
@@ -62,7 +60,6 @@ struct ZipInfo {
 	EndOfCD* centralDirectoryDesc;
 	char centralDirectoryEnd[0xffff + sizeof(EndOfCD)];
 	size_t centralDirectoryEndRecvd;
-	PartialZipProgressCallback progressCallback;
 };
 
 #ifdef __cplusplus
@@ -80,8 +77,6 @@ extern "C" {
 
 	void PartialZipRelease(ZipInfo* info);
 	
-	void PartialZipSetProgressCallback(ZipInfo* info, PartialZipProgressCallback progressCallback);
-
 #ifdef __cplusplus
 }
 #endif

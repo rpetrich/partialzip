@@ -25,24 +25,6 @@ static size_t receiveCentralDirectory(void* data, size_t size, size_t nmemb, Zip
 	return size * nmemb;
 }
 
-static size_t receiveData(void* data, size_t size, size_t nmemb, void** pFileData) {
-	memcpy(pFileData[0], data, size * nmemb);
-	pFileData[0] = ((char*)pFileData[0]) + (size * nmemb);
-	ZipInfo* info = ((ZipInfo*)pFileData[1]);
-	CDFile* file = ((CDFile*)pFileData[2]);
-	size_t* progress = ((size_t*)pFileData[3]);
-
-	if(progress) {
-		*progress += size * nmemb;
-	}
-
-	if(info && info->progressCallback && file) {
-		info->progressCallback(info, file, *progress);
-	}
-
-	return size * nmemb;
-}
-
 static CDFile* flipFiles(ZipInfo* info)
 {
 	char* cur = info->centralDirectory;
@@ -80,7 +62,6 @@ ZipInfo* PartialZipInit(const char* url)
 	info->centralDirectoryRecvd = 0;
 	info->centralDirectoryEndRecvd = 0;
 	info->centralDirectoryDesc = NULL;
-	info->progressCallback = NULL;
 
 	info->hCurl = curl_easy_init();
 
@@ -585,11 +566,6 @@ bool PartialZipGetFile(ZipInfo* info, CDFile* file, PartialZipGetFileCallback ca
 {
 	CDFile *files[1] = { file };
 	return PartialZipGetFiles(info, files, 1, callback, userInfo);
-}
-
-void PartialZipSetProgressCallback(ZipInfo* info, PartialZipProgressCallback progressCallback)
-{
-	info->progressCallback = progressCallback;
 }
 
 void PartialZipRelease(ZipInfo* info)
