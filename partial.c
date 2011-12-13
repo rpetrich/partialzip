@@ -250,12 +250,22 @@ typedef struct ReceiveBodyFileData {
 	z_stream stream; // Unused for uncompressed data
 } ReceiveBodyFileData;
 
+typedef enum {
+	MultipartDecodeStateInHeader,
+	MultipartDecodeStateFoundFirstCR,
+	MultipartDecodeStateFoundFirstNL,
+	MultipartDecodeStateFoundSecondCR,
+	MultipartDecodeStateInBody,
+} MultipartDecodeState;
+
 typedef struct ReceiveBodyData {
 	ZipInfo *info;
 	PartialZipGetFileCallback callback;
 	void *userInfo;
 	ReceiveBodyFileData *currentFile;
-	unsigned char *multipartBoundary;
+	bool foundMultipartBoundary;
+	MultipartDecodeState multipartDecodeState;
+	size_t bytesRemainingInRange;
 } ReceiveDataBodyData;
 
 // Uncompressed File Data
@@ -408,16 +418,7 @@ static size_t receiveHeaderMulti(unsigned char* data, size_t size, size_t nmemb,
 	size_t byteCount = size * nmemb;
 	if (byteCount > sizeof(BOUNDARY_HEADER_PREFIX)) {
 		if (memcmp(data, BOUNDARY_HEADER_PREFIX, sizeof(BOUNDARY_HEADER_PREFIX)-1) == 0) {
-			unsigned char *start = data + sizeof(BOUNDARY_HEADER_PREFIX)-1;
-			unsigned char *end = start;
-			while (*end != '\r')
-				end++;
-			unsigned char *copy = malloc(end - start);
-			memcpy(copy, start, end - start);
-			copy[end - start] = '\0';
-			if (bodyData->multipartBoundary)
-				free(bodyData->multipartBoundary);
-			bodyData->multipartBoundary = copy;
+			bodyData->foundMultipartBoundary = true;
 		}
 	}
 	return byteCount;
@@ -426,10 +427,59 @@ static size_t receiveHeaderMulti(unsigned char* data, size_t size, size_t nmemb,
 static size_t receiveDataBodyMulti(unsigned char* data, size_t size, size_t nmemb, ReceiveDataBodyDataRef bodyData)
 {
 	// Check if server Returned a multipart/byteranges
-	if (!bodyData->multipartBoundary)
+	if (!bodyData->foundMultipartBoundary)
 		return 0;
-	// TODO: Implement multpart decoding
-	return 0;
+	size_t byteCount = size * nmemb;
+	MultipartDecodeState state = bodyData->multipartDecodeState;
+	do {
+		switch (state) {
+			case MultipartDecodeStateInHeader:
+				if (*data == '\r')
+					state = MultipartDecodeStateFoundFirstCR;
+				byteCount--;
+				data++;
+				break;
+			case MultipartDecodeStateFoundFirstCR:
+				state = (*data == '\n') ? MultipartDecodeStateFoundFirstNL : MultipartDecodeStateInHeader;
+				byteCount--;
+				data++;
+				break;
+			case MultipartDecodeStateFoundFirstNL:
+				state = (*data == '\r') ? MultipartDecodeStateFoundSecondCR : MultipartDecodeStateInHeader;
+				byteCount--;
+				data++;
+				break;
+			case MultipartDecodeStateFoundSecondCR:
+				if (*data == '\n') {
+					state = MultipartDecodeStateInBody;
+					bodyData->bytesRemainingInRange = bodyData->currentFile->rangeSize;
+				} else {
+					state = MultipartDecodeStateInHeader;
+				}
+				byteCount--;
+				data++;
+				break;
+			case MultipartDecodeStateInBody: {
+				if (byteCount < bodyData->bytesRemainingInRange) {
+					if (receiveDataBodySingle(data, 1, byteCount, bodyData) != byteCount)
+						return 0;
+					bodyData->bytesRemainingInRange -= byteCount;
+					byteCount = 0;
+				} else {
+					if (receiveDataBodySingle(data, 1, bodyData->bytesRemainingInRange, bodyData) != bodyData->bytesRemainingInRange)
+						return 0;
+					byteCount -= bodyData->bytesRemainingInRange;
+					data += bodyData->bytesRemainingInRange;
+					bodyData->bytesRemainingInRange = 0;
+					bodyData->currentFile++;
+					state = MultipartDecodeStateInHeader;
+				}
+				break;
+			}
+		}
+	} while(byteCount);
+	bodyData->multipartDecodeState = state;
+	return size * nmemb;
 }
 
 
@@ -464,7 +514,7 @@ bool PartialZipGetFiles(ZipInfo* info, CDFile* files[], size_t count, PartialZip
 	for (i = 0; i < count; i++) {
 		uint64_t start = files[i]->offset;
 		uint64_t end = PartialZipFileMaximumEndpoint(info, files[i]);
-		fileData[i].rangeSize = end - start - 1;
+		fileData[i].rangeSize = end - start;
 		char temp[100];
 		rangeLength += sprintf(temp, "%" PRIu64 "%" PRIu64, start, end) + 2;
 	}
@@ -472,7 +522,7 @@ bool PartialZipGetFiles(ZipInfo* info, CDFile* files[], size_t count, PartialZip
 	char *rangeCurrent = range;
 	for (i = 0; i < count; i++) {
 		uint64_t start = files[i]->offset;
-		uint64_t end = start + fileData[i].rangeSize;
+		uint64_t end = start + fileData[i].rangeSize - 1;
 		rangeCurrent += sprintf(rangeCurrent, "%" PRIu64 "-%" PRIu64 ",", start, end);
 	}
 	rangeCurrent[-1] = '\0';
@@ -516,17 +566,16 @@ bool PartialZipGetFiles(ZipInfo* info, CDFile* files[], size_t count, PartialZip
 		curl_easy_setopt(info->hCurl, CURLOPT_WRITEFUNCTION, receiveDataBodyMulti);
 		curl_easy_setopt(info->hCurl, CURLOPT_HEADERDATA, &bodyData);
 		curl_easy_setopt(info->hCurl, CURLOPT_HEADERFUNCTION, receiveHeaderMulti);
-		bodyData.multipartBoundary = NULL;
+		bodyData.foundMultipartBoundary = false;
+		bodyData.multipartDecodeState = MultipartDecodeStateInHeader;
 		curl_result = curl_easy_perform(info->hCurl);
-		//if (bodyData.multipartBoundary) {
-			free(bodyData.multipartBoundary);
-		//} else {
+		if (!bodyData.foundMultipartBoundary) {
 			// Multi-part failed, fallback to a single request per file
 			for (i = 0; i < count; i++)
 				if (!PartialZipGetFiles(info, &files[i], 1, callback, userInfo))
 					return false;
 			return true;
-		//}
+		}
 	}
 
 	return curl_result == 0;
