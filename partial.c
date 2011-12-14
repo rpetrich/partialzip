@@ -237,7 +237,6 @@ typedef struct ReceiveBodyFileData {
 	void (*startBodyCallback)(ReceiveDataBodyDataRef);
 	size_t (*processBodyCallback)(unsigned char*, size_t, ReceiveDataBodyDataRef);
 	void (*finishBodyCallback)(ReceiveDataBodyDataRef);
-	z_stream stream; // Unused for uncompressed data
 } ReceiveBodyFileData;
 
 typedef enum {
@@ -256,6 +255,7 @@ typedef struct ReceiveBodyData {
 	bool foundMultipartBoundary;
 	MultipartDecodeState multipartDecodeState;
 	size_t bytesRemainingInRange;
+	z_stream stream; // Reused for each compressed stream
 } ReceiveDataBodyData;
 
 // Uncompressed File Data
@@ -275,32 +275,30 @@ static void finishBodyUncompressed(ReceiveDataBodyDataRef bodyData)
 
 // ZLIB Compressed File Data
 
-#define ZLIB_BUFFER_SIZE 4096
+#define ZLIB_BUFFER_SIZE 16384
 
 static void startBodyZLIBCompressed(ReceiveDataBodyDataRef bodyData)
 {
-	ReceiveBodyFileData *fileData = bodyData->currentFile;
-	fileData->stream.zalloc = Z_NULL;
-	fileData->stream.zfree = Z_NULL;
-	fileData->stream.opaque = Z_NULL;
-	fileData->stream.avail_in = 0;
-	fileData->stream.next_in = NULL;
-	inflateInit2(&fileData->stream, -MAX_WBITS);
+	bodyData->stream.zalloc = Z_NULL;
+	bodyData->stream.zfree = Z_NULL;
+	bodyData->stream.opaque = Z_NULL;
+	bodyData->stream.avail_in = 0;
+	bodyData->stream.next_in = NULL;
+	inflateInit2(&bodyData->stream, -MAX_WBITS);
 }
 
 static size_t receiveDataBodyZLIBCompressed(unsigned char* data, size_t size, ReceiveDataBodyDataRef bodyData)
 {
 	ReceiveBodyFileData *fileData = bodyData->currentFile;
-	fileData->stream.next_in = data;
-	size_t result = size;
-	fileData->stream.avail_in = result;
+	bodyData->stream.next_in = data;
+	bodyData->stream.avail_in = size;
 	unsigned char buffer[ZLIB_BUFFER_SIZE];
 	do {
-		fileData->stream.next_out = buffer;
-		fileData->stream.avail_out = ZLIB_BUFFER_SIZE;
-		int err = inflate(&fileData->stream, Z_NO_FLUSH);
-		if (fileData->stream.avail_out != ZLIB_BUFFER_SIZE) {
-			size_t new_bytes = ZLIB_BUFFER_SIZE - fileData->stream.avail_out;
+		bodyData->stream.next_out = buffer;
+		bodyData->stream.avail_out = ZLIB_BUFFER_SIZE;
+		int err = inflate(&bodyData->stream, Z_NO_FLUSH);
+		if (bodyData->stream.avail_out != ZLIB_BUFFER_SIZE) {
+			size_t new_bytes = ZLIB_BUFFER_SIZE - bodyData->stream.avail_out;
 			size_t bytes_read = bodyData->callback(bodyData->info, fileData->file, buffer, new_bytes, bodyData->userInfo);
 			if (bytes_read != new_bytes) {
 				// Abort if callback doesn't read all data
@@ -308,37 +306,37 @@ static size_t receiveDataBodyZLIBCompressed(unsigned char* data, size_t size, Re
 			}
 		}
 		switch (err) {
+			case Z_BUF_ERROR:
 			case Z_OK:
+				continue;
 			case Z_STREAM_END:
-				goto return_result;
+				return size;
 			default:
 				// Abort if there's some sort of zlib stream error
 				return 0;
 		}
-	} while (fileData->stream.avail_in);
-return_result:
-	return result;
+	} while (bodyData->stream.avail_out == 0);
+	return size;
 }
 
 static void finishBodyZLIBCompressed(ReceiveDataBodyDataRef bodyData)
 {
-	ReceiveBodyFileData *fileData = bodyData->currentFile;
 	unsigned char buffer[ZLIB_BUFFER_SIZE];
 	int err;
 	do {
-		fileData->stream.next_out = buffer;
-		fileData->stream.avail_out = ZLIB_BUFFER_SIZE;
-		err = inflate(&fileData->stream, Z_SYNC_FLUSH);
-		if (fileData->stream.avail_out != ZLIB_BUFFER_SIZE) {
-			size_t new_bytes = ZLIB_BUFFER_SIZE - fileData->stream.avail_out;
-			size_t bytes_read = bodyData->callback(bodyData->info, fileData->file, buffer, new_bytes, bodyData->userInfo);
+		bodyData->stream.next_out = buffer;
+		bodyData->stream.avail_out = ZLIB_BUFFER_SIZE;
+		err = inflate(&bodyData->stream, Z_SYNC_FLUSH);
+		if (bodyData->stream.avail_out != ZLIB_BUFFER_SIZE) {
+			size_t new_bytes = ZLIB_BUFFER_SIZE - bodyData->stream.avail_out;
+			size_t bytes_read = bodyData->callback(bodyData->info, bodyData->currentFile->file, buffer, new_bytes, bodyData->userInfo);
 			if (bytes_read != new_bytes) {
 				// Abort if callback doesn't read all data
 				break;
 			}
 		}
 	} while (err == Z_OK);
-	inflateEnd(&fileData->stream);
+	inflateEnd(&bodyData->stream);
 }
 
 // Single part responses (single range)
@@ -393,7 +391,6 @@ static size_t receiveDataBodySingle(unsigned char* data, size_t size, size_t nme
 		if (pFileData->processBodyCallback(data, pFileData->bytesLeftInData, bodyData) != pFileData->bytesLeftInData)
 			return 0;
 		pFileData->finishBodyCallback(bodyData);
-		byteCount -= pFileData->bytesLeftInData;
 		pFileData->bytesLeftInData = 0;
 	}
 	return size * nmemb;
