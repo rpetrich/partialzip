@@ -25,7 +25,7 @@ static size_t receiveCentralDirectory(void* data, size_t size, size_t nmemb, Zip
 	return size * nmemb;
 }
 
-static CDFile* flipFiles(ZipInfo* info)
+static void flipFiles(ZipInfo* info)
 {
 	char* cur = info->centralDirectory;
 
