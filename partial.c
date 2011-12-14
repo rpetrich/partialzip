@@ -492,7 +492,7 @@ bool PartialZipGetFiles(ZipInfo* info, CDFile* files[], size_t count, PartialZip
 	if (!count)
 		return true;
 
-	ReceiveBodyFileData fileData[count];
+	ReceiveBodyFileData *fileData = malloc(sizeof(ReceiveBodyFileData) * count);
 	curl_easy_setopt(info->hCurl, CURLOPT_HTTPGET, 1);
 
 	// Apply Range string
@@ -549,6 +549,7 @@ bool PartialZipGetFiles(ZipInfo* info, CDFile* files[], size_t count, PartialZip
 		curl_easy_setopt(info->hCurl, CURLOPT_HEADERDATA, NULL);
 		curl_easy_setopt(info->hCurl, CURLOPT_HEADERFUNCTION, NULL);
 		curl_result = curl_easy_perform(info->hCurl);
+		free(fileData);
 	} else {
 		curl_easy_setopt(info->hCurl, CURLOPT_WRITEFUNCTION, receiveDataBodyMulti);
 		curl_easy_setopt(info->hCurl, CURLOPT_HEADERDATA, &bodyData);
@@ -556,6 +557,7 @@ bool PartialZipGetFiles(ZipInfo* info, CDFile* files[], size_t count, PartialZip
 		bodyData.foundMultipartBoundary = false;
 		bodyData.multipartDecodeState = MultipartDecodeStateInHeader;
 		curl_result = curl_easy_perform(info->hCurl);
+		free(fileData);
 		if (!bodyData.foundMultipartBoundary) {
 			// Multi-part failed, fallback to a single request per file
 			for (i = 0; i < count; i++)
