@@ -213,6 +213,15 @@ CDFile* PartialZipListFiles(ZipInfo* info)
 	return NULL;
 }
 
+unsigned char* PartialZipCopyFileName(ZipInfo* info, CDFile* file)
+{
+	const unsigned char* curFileName = (const unsigned char*)file + sizeof(CDFile);
+	unsigned char* result = malloc(file->lenFileName + 1);
+	memcpy(result, curFileName, file->lenFileName);
+	result[file->lenFileName] = '\0';
+	return result;
+}
+
 typedef struct ReceiveBodyData* ReceiveDataBodyDataRef;
 
 typedef struct ReceiveBodyFileData {

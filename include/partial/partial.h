@@ -69,6 +69,7 @@ extern "C" {
 	ZipInfo* PartialZipInit(const char* url);
 
 	CDFile* PartialZipFindFile(ZipInfo* info, const char* fileName);
+	unsigned char* PartialZipCopyFileName(ZipInfo* info, CDFile* file);
 
 	CDFile* PartialZipListFiles(ZipInfo* info);
 
