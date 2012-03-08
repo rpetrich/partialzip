@@ -505,7 +505,7 @@ bool PartialZipGetFiles(ZipInfo* info, CDFile* files[], size_t count, PartialZip
 		char temp[100];
 		rangeLength += sprintf(temp, "%" PRIu64 "%" PRIu64, start, end) + 2;
 	}
-	char range[rangeLength];
+	char range[rangeLength+1];
 	char *rangeCurrent = range;
 	for (i = 0; i < count; i++) {
 		uint64_t start = files[i]->offset;
